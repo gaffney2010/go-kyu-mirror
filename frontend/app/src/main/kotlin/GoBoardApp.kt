@@ -7,13 +7,20 @@ import javafx.scene.control.Label
 import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.paint.Color
-import javafx.scene.text.Font
 import javafx.stage.Stage
 import kotlin.math.min
 
 // Enum to represent the players or an empty intersection.
 enum class Player {
-    BLACK, WHITE, EMPTY
+    BLACK, WHITE, EMPTY;
+
+    fun opponent(): Player {
+        return when (this) {
+            BLACK -> WHITE
+            WHITE -> BLACK
+            EMPTY -> EMPTY
+        }
+    }
 }
 
 // Data class to hold information about a single move.
@@ -60,7 +67,7 @@ class GoBoardApp : Application() {
     private val boardSize = 19 // We'll get the real size from SGF, but have a default.
     private val canvasSize = 800.0
     private val padding = 40.0
-    private val cellWidth = (canvasSize - 2 * padding) / (boardSize - 1)
+    private var cellWidth = (canvasSize - 2 * padding) / (boardSize - 1)
 
     // --- Game State ---
     private lateinit var game: GoGame
@@ -76,17 +83,18 @@ class GoBoardApp : Application() {
 
     override fun start(primaryStage: Stage) {
         // 1. Load the game data from a fixed file in the resources folder.
-        // Make sure you have a file at "src/main/resources/game.sgf"
         val sgfData = try {
             val resourceStream = GoBoardApp::class.java.getResourceAsStream("/game.sgf")
             resourceStream!!.bufferedReader().readText()
         } catch (e: Exception) {
             println("ERROR: Could not load '/game.sgf'. Make sure it's in 'src/main/resources'.")
             println("Loading a default empty game as a fallback.")
-            // Provide a default empty SGF so the app doesn't crash if the file is missing.
             "(;FF[4]GM[1]SZ[19])"
         }
+        
         game = GoGame(sgfData)
+        // Update cellWidth in case the SGF had a different board size
+        cellWidth = (canvasSize - 2 * padding) / (game.size - 1)
 
         // 2. Set up the initial board state (an empty board).
         val initialBoard = Array(game.size) { Array(game.size) { Player.EMPTY } }
@@ -133,14 +141,15 @@ class GoBoardApp : Application() {
         
         currentMoveIndex = newIndex
         
-        // If we are moving forward to a state we haven't calculated yet...
         if (currentMoveIndex >= 0 && currentMoveIndex >= boardHistory.size - 1) {
-            // Get the last known board state.
             val lastBoard = boardHistory.last().map { it.clone() }.toTypedArray()
-            
-            // Apply the current move.
             val move = game.moves[currentMoveIndex]
+            
+            // Place the new stone on the board
             lastBoard[move.y][move.x] = move.player
+            
+            // --- NEW CODE: Check for and remove captured stones ---
+            handleCaptures(lastBoard, move)
             
             // Add the new board state to our history.
             boardHistory.add(lastBoard)
@@ -151,38 +160,97 @@ class GoBoardApp : Application() {
     }
 
     /**
-     * Updates the label showing the current move number.
+     * After a move is played, checks adjacent opponent groups for captures.
+     * Also checks for self-capture (suicide).
      */
+    private fun handleCaptures(board: Array<Array<Player>>, move: Move) {
+        val opponent = move.player.opponent()
+        
+        // Check neighbors for opponent groups to capture
+        for (neighbor in getNeighbors(move.x, move.y)) {
+            val (nx, ny) = neighbor
+            if (board[ny][nx] == opponent) {
+                val (liberties, group) = findGroup(board, nx, ny)
+                if (liberties == 0) {
+                    group.forEach { (gx, gy) -> board[gy][gx] = Player.EMPTY }
+                }
+            }
+        }
+        
+        // Check for suicide move (only if no opponent stones were captured)
+        val (myLiberties, myGroup) = findGroup(board, move.x, move.y)
+        if (myLiberties == 0) {
+            myGroup.forEach { (gx, gy) -> board[gy][gx] = Player.EMPTY }
+        }
+    }
+
+    /**
+     * Finds a group of connected stones and counts its liberties.
+     * @return A Pair containing the number of liberties (Int) and a Set of stone coordinates (Pair<Int, Int>).
+     */
+    private fun findGroup(board: Array<Array<Player>>, startX: Int, startY: Int): Pair<Int, Set<Pair<Int, Int>>> {
+        val player = board[startY][startX]
+        if (player == Player.EMPTY) return 0 to emptySet()
+
+        val queue = ArrayDeque<Pair<Int, Int>>()
+        val visitedStones = mutableSetOf<Pair<Int, Int>>()
+        val liberties = mutableSetOf<Pair<Int, Int>>()
+
+        queue.add(startX to startY)
+        visitedStones.add(startX to startY)
+
+        while (queue.isNotEmpty()) {
+            val (x, y) = queue.removeFirst()
+
+            for (neighbor in getNeighbors(x, y)) {
+                val (nx, ny) = neighbor
+                val neighborState = board[ny][nx]
+
+                if (neighborState == Player.EMPTY) {
+                    liberties.add(neighbor)
+                } else if (neighborState == player && neighbor !in visitedStones) {
+                    visitedStones.add(neighbor)
+                    queue.add(neighbor)
+                }
+            }
+        }
+        return liberties.size to visitedStones
+    }
+
+    /**
+     * Gets valid neighbor coordinates for a given point.
+     */
+    private fun getNeighbors(x: Int, y: Int): List<Pair<Int, Int>> {
+        val neighbors = mutableListOf<Pair<Int, Int>>()
+        if (x > 0) neighbors.add(x - 1 to y)
+        if (x < game.size - 1) neighbors.add(x + 1 to y)
+        if (y > 0) neighbors.add(x to y - 1)
+        if (y < game.size - 1) neighbors.add(x to y + 1)
+        return neighbors
+    }
+
     private fun updateMoveLabel() {
         val displayMove = currentMoveIndex + 1
         moveLabel.text = "Move: $displayMove / ${game.moves.size}"
         moveLabel.style = "-fx-text-fill: #cccccc; -fx-font-size: 14px;"
     }
 
-    /**
-     * Clears the canvas and redraws the entire board, including grid, hoshi, and stones.
-     */
     private fun drawBoard() {
         val gc = canvas.graphicsContext2D
         gc.clearRect(0.0, 0.0, canvas.width, canvas.height)
 
-        // Draw board background
-        gc.fill = Color.web("#d1a36e") // A traditional go board color
+        gc.fill = Color.web("#d1a36e")
         gc.fillRect(0.0, 0.0, canvas.width, canvas.height)
 
-        // Draw grid lines
         gc.stroke = Color.BLACK
         gc.lineWidth = 1.0
         for (i in 0 until game.size) {
             val pos = padding + i * cellWidth
-            // Vertical line
             gc.strokeLine(pos, padding, pos, canvasSize - padding)
-            // Horizontal line
             gc.strokeLine(padding, pos, canvasSize - padding, pos)
         }
 
-        // Draw hoshi (star points)
-        val hoshiCoords = if (game.size == 19) listOf(3, 9, 15) else listOf(2, 6)
+        val hoshiCoords = if (game.size == 19) listOf(3, 9, 15) else listOf()
         gc.fill = Color.BLACK
         for (x in hoshiCoords) {
             for (y in hoshiCoords) {
@@ -192,20 +260,15 @@ class GoBoardApp : Application() {
             }
         }
         
-        // Draw stones
         drawStones()
     }
 
-    /**
-     * Draws the stones based on the current board state.
-     */
     private fun drawStones() {
         val gc = canvas.graphicsContext2D
         val stoneRadius = cellWidth / 2.0 * 0.95
         
-        // Get the correct board state from history.
-        // Index is currentMoveIndex + 1 because history[0] is the empty board.
         val currentBoard = boardHistory[currentMoveIndex + 1]
+        val lastMove = if (currentMoveIndex >= 0) game.moves[currentMoveIndex] else null
 
         for (y in 0 until game.size) {
             for (x in 0 until game.size) {
@@ -217,11 +280,16 @@ class GoBoardApp : Application() {
                     gc.fill = if (player == Player.BLACK) Color.BLACK else Color.WHITE
                     gc.fillOval(centerX - stoneRadius, centerY - stoneRadius, stoneRadius * 2, stoneRadius * 2)
 
-                    // Add a subtle border to white stones to make them pop
                     if (player == Player.WHITE) {
                         gc.stroke = Color.BLACK
                         gc.lineWidth = 0.5
                         gc.strokeOval(centerX - stoneRadius, centerY - stoneRadius, stoneRadius * 2, stoneRadius * 2)
+                    }
+                    
+                    if (lastMove != null && x == lastMove.x && y == lastMove.y) {
+                        gc.fill = if (lastMove.player == Player.BLACK) Color.WHITE else Color.BLACK
+                        val dotRadius = stoneRadius * 0.3
+                        gc.fillOval(centerX - dotRadius, centerY - dotRadius, dotRadius * 2, dotRadius * 2)
                     }
                 }
             }
@@ -229,7 +297,6 @@ class GoBoardApp : Application() {
     }
 }
 
-// The main entry point for the application.
 fun main() {
     Application.launch(GoBoardApp::class.java)
 }
