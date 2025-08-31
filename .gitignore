@@ -1,1 +1,3 @@
 data
+backend/preprocessing_state.txt
+*.log

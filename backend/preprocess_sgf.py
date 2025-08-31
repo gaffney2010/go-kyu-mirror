@@ -1,8 +1,25 @@
 import os
+# --- GPU Configuration ---
+# Set this environment variable BEFORE importing TensorFlow to disable the GPU.
+# This is the most reliable way to prevent CUDA initialization errors on CPU-only machines
+# or machines with driver issues.
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 import random
 import numpy as np
 import tensorflow as tf
 from sgfmill import sgf, sgf_moves
+import logging
+
+# --- Logging Configuration ---
+# Set up logging to write to a file instead of the console.
+logging.basicConfig(
+    filename='output.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logging.info("CUDA_VISIBLE_DEVICES set to -1. Forcing CPU execution.")
+
 
 # --- Configuration ---
 SGF_DIRECTORY = 'data/sgfs-by-date'
@@ -112,17 +129,17 @@ def main():
     # --- Create Directories for each Rank ---
     for rank in TARGET_RANKS:
         os.makedirs(os.path.join(TFRECORD_OUTPUT_DIR, rank), exist_ok=True)
-    print(f"Ensured directories exist for ranks: {', '.join(TARGET_RANKS)}")
+    logging.info(f"Ensured directories exist for ranks: {', '.join(TARGET_RANKS)}")
 
     # --- Load State ---
     processed_files = set()
     if os.path.exists(STATE_FILE):
-        print(f"Found state file '{STATE_FILE}'. Loading list of processed files.")
+        logging.info(f"Found state file '{STATE_FILE}'. Loading list of processed files.")
         with open(STATE_FILE, 'r') as f:
             for line in f:
                 processed_files.add(line.strip())
     
-    print("Finding all SGF files...")
+    logging.info("Finding all SGF files...")
     all_sgf_files = []
     for root, _, files in os.walk(SGF_DIRECTORY):
         for file in files:
@@ -132,17 +149,17 @@ def main():
     # --- Filter Out Already Processed Files ---
     files_to_process = [f for f in all_sgf_files if f not in processed_files]
     
-    print(f"Found {len(all_sgf_files)} total SGF files.")
-    print(f"{len(processed_files)} files have already been processed.")
-    print(f"{len(files_to_process)} files remaining to process.")
+    logging.info(f"Found {len(all_sgf_files)} total SGF files.")
+    logging.info(f"{len(processed_files)} files have already been processed.")
+    logging.info(f"{len(files_to_process)} files remaining to process.")
 
     if not files_to_process:
-        print("All files have been processed. Exiting.")
+        logging.info("All files have been processed. Exiting.")
         return
 
     random.shuffle(files_to_process)
     
-    print(f"Starting preprocessing...")
+    logging.info(f"Starting preprocessing...")
     total_moves_processed = 0
     target_ranks_set = set(TARGET_RANKS)
     
@@ -150,7 +167,7 @@ def main():
     with open(STATE_FILE, 'a') as state_f:
         for i, file_path in enumerate(files_to_process):
             if i > 0 and i % 1000 == 0:
-                print(f"  Processed {i}/{len(files_to_process)} new files...")
+                logging.info(f"  Processed {i}/{len(files_to_process)} new files...")
             
             # Collect all moves from the SGF first to avoid partial writes on error.
             moves_to_write = {}
@@ -187,8 +204,8 @@ def main():
                 state_f.write(file_path + '\n')
                 state_f.flush() # Ensure it's written to disk immediately
         
-    print("\nPreprocessing complete.")
-    print(f"Total moves written to TFRecords in this session: {total_moves_processed}")
+    logging.info("\nPreprocessing complete.")
+    logging.info(f"Total moves written to TFRecords in this session: {total_moves_processed}")
 
 if __name__ == '__main__':
     main()
