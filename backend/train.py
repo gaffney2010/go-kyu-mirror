@@ -12,7 +12,8 @@ from tensorflow.keras.models import Model
 # --- Configuration ---
 # Point this to the directory containing the preprocessed data for the desired rank.
 TFRECORD_DIRECTORY = 'data/tfrecords/10k'
-MODEL_FILE = 'go_bot_10k_predictor.h5'  # Where to save the trained model.
+# Keras requires the '.weights.h5' extension when using save_weights_only=True.
+MODEL_FILE = 'go_bot_10k_predictor.weights.h5'  # Where to save the trained model weights.
 
 BOARD_SIZE = 19
 INPUT_SHAPE = (BOARD_SIZE, BOARD_SIZE, 2)  # Board state: player's stones, opponent's stones
@@ -137,3 +138,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

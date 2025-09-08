@@ -41,6 +41,7 @@ dependencies {
 
     // This dependency is used by the application.
     implementation(libs.guava)
+    implementation("org.tensorflow:tensorflow-core-platform:0.5.0")
 }
 
 // Apply a specific Java toolchain to ease working on different environments.

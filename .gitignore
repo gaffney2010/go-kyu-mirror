@@ -1,3 +1,6 @@
 data
 backend/preprocessing_state.txt
 *.log
+__pycache__
+exported_model
+*.h5
