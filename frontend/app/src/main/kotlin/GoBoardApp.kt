@@ -1,4 +1,5 @@
 import javafx.application.Application
+import javafx.application.Platform
 import javafx.geometry.Pos
 import javafx.scene.Scene
 import javafx.scene.canvas.Canvas
@@ -8,12 +9,16 @@ import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.paint.Color
 import javafx.stage.Stage
+import org.tensorflow.Result
 import org.tensorflow.SavedModelBundle
+import org.tensorflow.Tensor
+import org.tensorflow.ndarray.NdArrays
 import org.tensorflow.ndarray.Shape
-import org.tensorflow.ndarray.buffer.FloatDataBuffer
+import org.tensorflow.ndarray.buffer.DataBuffers
 import org.tensorflow.types.TFloat32
 import java.nio.FloatBuffer
-import kotlin.math.min
+import java.util.Optional
+import kotlin.concurrent.thread
 
 // Enum to represent the players or an empty intersection.
 enum class Player {
@@ -51,11 +56,11 @@ class GoGame(sgf: String) {
         moves = ";([BW])\\[([a-z]{2})\\]".toRegex().findAll(sgf).map { matchResult ->
             val (playerStr, posStr) = matchResult.destructured
             val player = if (playerStr == "B") Player.BLACK else Player.WHITE
-            
+
             // SGF coordinates are 'a' through 's'. 'a' corresponds to index 0.
             val x = posStr[0] - 'a'
             val y = posStr[1] - 'a'
-            
+
             Move(player, x, y)
         }.toList()
     }
@@ -77,12 +82,12 @@ class GoBoardApp : Application() {
     // --- Game State ---
     private lateinit var game: GoGame
     private var currentMoveIndex = -1 // -1 represents the empty board before the first move.
-    
+
     // Stores the board state at each point in the game's history.
     // This allows us to go backward without re-calculating the entire game.
     private val boardHistory = mutableListOf<Array<Array<Player>>>()
 
-    // --- NEW: AI Model Properties ---
+    // --- AI Model Properties ---
     private var model: SavedModelBundle? = null
     private var predictedMove: Pair<Int, Int>? = null // Store the predicted (x, y)
 
@@ -100,7 +105,7 @@ class GoBoardApp : Application() {
             println("Loading a default empty game as a fallback.")
             "(;FF[4]GM[1]SZ[19])"
         }
-        
+
         game = GoGame(sgfData)
         // Update cellWidth in case the SGF had a different board size
         cellWidth = (canvasSize - 2 * padding) / (game.size - 1)
@@ -108,13 +113,13 @@ class GoBoardApp : Application() {
         // 2. Set up the initial board state (an empty board).
         val initialBoard = Array(game.size) { Array(game.size) { Player.EMPTY } }
         boardHistory.add(initialBoard)
-        
+
         // 3. Configure UI controls (buttons).
         val prevButton = Button("< Prev").apply {
             setOnAction { navigateTo(currentMoveIndex - 1) }
         }
         val nextButton = Button("Next >").apply {
-            setOnAction { navigateTo(currentMove_index + 1) }
+            setOnAction { navigateTo(currentMoveIndex + 1) }
         }
 
         // 4. Arrange UI elements in the window.
@@ -122,7 +127,7 @@ class GoBoardApp : Application() {
             alignment = Pos.CENTER
             style = "-fx-padding: 10;"
         }
-        
+
         val root = BorderPane().apply {
             center = canvas
             bottom = controls
@@ -133,10 +138,13 @@ class GoBoardApp : Application() {
         updateMoveLabel()
         drawBoard()
 
-        // --- NEW: Load the TensorFlow model ---
+        // Load the TensorFlow model
         try {
-            // Assumes the 'exported_model' directory is in the root of your project
-            model = SavedModelBundle.load("exported_model", "serve")
+            // Get the absolute path from the system property we set in Gradle.
+            val modelPath = System.getProperty("model.path", "exported_model")
+            println("Attempting to load model from path: $modelPath") // For debugging
+
+            model = SavedModelBundle.load(modelPath, "serve")
             println("TensorFlow model loaded successfully.")
         } catch (e: Exception) {
             println("ERROR: Could not load TensorFlow model from 'exported_model' directory.")
@@ -150,7 +158,7 @@ class GoBoardApp : Application() {
         primaryStage.show()
     }
 
-    // --- NEW: Clean up model resources on application exit ---
+    // Clean up model resources on application exit
     override fun stop() {
         model?.close()
         super.stop()
@@ -163,31 +171,29 @@ class GoBoardApp : Application() {
         if (newIndex < -1 || newIndex >= game.moves.size) {
             return // Out of bounds
         }
-        
+
         currentMoveIndex = newIndex
-        
+
         if (currentMoveIndex >= 0 && currentMoveIndex >= boardHistory.size - 1) {
             val lastBoard = boardHistory.last().map { it.clone() }.toTypedArray()
             val move = game.moves[currentMoveIndex]
-            
+
             // Place the new stone on the board
             lastBoard[move.y][move.x] = move.player
-            
+
             // Check for and remove captured stones
             handleCaptures(lastBoard, move)
-            
+
             // Add the new board state to our history.
             boardHistory.add(lastBoard)
         }
-        
-        // --- MODIFIED: Trigger prediction and redraw ---
-        updateMoveLabel()
-        predictedMove = null // Clear old prediction while new one is calculated
-        drawBoard() // Draw immediately to feel responsive
 
-        // Run prediction and redraw with the hint
+        updateMoveLabel()
+        predictedMove = null // Clear old prediction
+        drawBoard() // Redraw immediately to remove the old hint
+
+        // Run prediction in the background
         runPrediction()
-        drawBoard()
     }
 
     /**
@@ -196,7 +202,7 @@ class GoBoardApp : Application() {
      */
     private fun handleCaptures(board: Array<Array<Player>>, move: Move) {
         val opponent = move.player.opponent()
-        
+
         // Check neighbors for opponent groups to capture
         for (neighbor in getNeighbors(move.x, move.y)) {
             val (nx, ny) = neighbor
@@ -207,7 +213,7 @@ class GoBoardApp : Application() {
                 }
             }
         }
-        
+
         // Check for suicide move (only if no opponent stones were captured)
         val (myLiberties, myGroup) = findGroup(board, move.x, move.y)
         if (myLiberties == 0) {
@@ -260,59 +266,83 @@ class GoBoardApp : Application() {
         return neighbors
     }
 
-    // --- NEW: AI Prediction Functions ---
-    
+    // --- AI Prediction Functions ---
+
     /**
      * Runs the loaded TensorFlow model to predict the next move.
      */
     private fun runPrediction() {
-        // Ensure model is loaded and we are not on the final move
-        if (model == null || currentMoveIndex >= game.moves.size - 1) {
-            predictedMove = null
+        // Guard clause: Don't predict if model isn't loaded or game is over.
+        if (model == null || currentMoveIndex >= game.moves.size) {
+            Platform.runLater {
+                predictedMove = null
+                drawBoard()
+            }
             return
         }
 
-        val board = boardHistory[currentMoveIndex + 1]
-        // Determine who is the current player to make the next move
-        val nextPlayer = if (currentMoveIndex < 0) Player.BLACK else game.moves[currentMoveIndex].player.opponent()
+        // Run inference on a background thread to prevent UI freezing
+        thread(isDaemon = true) {
+            try {
+                val board = boardHistory[currentMoveIndex + 1]
+                val nextPlayer = if (currentMoveIndex < 0) Player.BLACK else game.moves[currentMoveIndex].player.opponent()
+                
+                var finalPrediction: Pair<Int, Int>? = null
 
-        // Tensors must be closed to free memory. The 'use' block handles this automatically.
-        TFloat32.tensorOf(createInputShape(), createInputBuffer(board, nextPlayer)).use { inputTensor ->
-            val result = model!!.session().runner()
-                .feed("serving_default_board_state", inputTensor) // Input layer name from Python
-                .fetch("StatefulPartitionedCall") // Default output layer name
-                .run()
-                .first()
+                // Create input tensor
+                TFloat32.tensorOf(createInputShape(), DataBuffers.of(createInputBuffer(board, nextPlayer))).use { inputTensor ->
 
-            result.use { outputTensor ->
-                // The output is a 2D tensor of shape [1, 362]. We need to get the data from it.
-                val probabilities = FloatArray(game.size * game.size + 1)
-                (outputTensor as TFloat32).read(probabilities)
-
-                // Find the move with the highest probability that is also a valid (empty) spot.
-                var bestMoveIndex = -1
-                var maxProb = -1.0f
-
-                for (i in probabilities.indices) {
-                    val x = i % game.size
-                    val y = i / game.size
-                    val isPassMove = (i == game.size * game.size)
+                    // Use the SavedModel signature instead of low-level Session API
+                    val servingDefault = model!!.function("serving_default")
                     
-                    // Check if the spot is empty or if it's the pass move
-                    if (probabilities[i] > maxProb && (isPassMove || board[y][x] == Player.EMPTY)) {
-                        maxProb = probabilities[i]
-                        bestMoveIndex = i
+                    // Create input map with the correct tensor name
+                    val inputs = mapOf("keras_tensor" to inputTensor)
+                    
+                    // Run inference
+                    val outputs = servingDefault.call(inputs)
+                    
+                    // Get the output tensor - extract from Optional
+                    val outputTensorOpt = outputs["output_0"] as Optional<*>
+                    val outputTensor = outputTensorOpt.get() as TFloat32
+
+                    // Process Output Tensor - try direct access instead of copyTo
+                    val probabilities = FloatArray(game.size * game.size + 1)
+
+                    // Copy values manually instead of using copyTo
+                    for (i in probabilities.indices) {
+                        probabilities[i] = outputTensor.getFloat(0, i.toLong())
+                    }
+
+                    var bestMoveIndex = -1
+                    var maxProb = -1.0f
+                    for (i in probabilities.indices) {
+                        val x = i % game.size
+                        val y = i / game.size
+                        val isPassMove = (i == game.size * game.size)
+                        if (probabilities[i] > maxProb && (isPassMove || board[y][x] == Player.EMPTY)) {
+                            maxProb = probabilities[i]
+                            bestMoveIndex = i
+                        }
+                    }
+
+                    finalPrediction = if (bestMoveIndex != -1 && bestMoveIndex < game.size * game.size) {
+                        val x = bestMoveIndex % game.size
+                        val y = bestMoveIndex / game.size
+                        x to y
+                    } else {
+                        null
                     }
                 }
-
-                // Convert index back to coordinates
-                predictedMove = if (bestMoveIndex != -1 && bestMoveIndex < game.size * game.size) {
-                    val x = bestMoveIndex % game.size
-                    val y = bestMoveIndex / game.size
-                    x to y
-                } else {
-                    null // Prediction is to pass or invalid
+                
+                // Update the UI on the JavaFX Application Thread
+                Platform.runLater {
+                    predictedMove = finalPrediction
+                    drawBoard()
                 }
+
+            } catch (e: Exception) {
+                println("Error during model inference: ${e.message}")
+                e.printStackTrace()
             }
         }
     }
@@ -323,29 +353,19 @@ class GoBoardApp : Application() {
     }
 
     /** Helper function to convert our board array to the required FloatBuffer for the model */
-    private fun createInputBuffer(board: Array<Array<Player>>, currentPlayer: Player): FloatDataBuffer {
-        val opponent = currentPlayer.opponent()
+    private fun createInputBuffer(board: Array<Array<Player>>, currentPlayer: Player): FloatBuffer {
         val buffer = FloatBuffer.allocate(1 * game.size * game.size * 2)
         for (y in 0 until game.size) {
             for (x in 0 until game.size) {
                 when (board[y][x]) {
-                    currentPlayer -> {
-                        buffer.put(1.0f) // Player's stone in the first channel
-                        buffer.put(0.0f)
-                    }
-                    opponent -> {
-                        buffer.put(0.0f)
-                        buffer.put(1.0f) // Opponent's stone in the second channel
-                    }
-                    else -> {
-                        buffer.put(0.0f)
-                        buffer.put(0.0f)
-                    }
+                    Player.BLACK -> { buffer.put(1.0f); buffer.put(0.0f) }  // Always black in channel 0
+                    Player.WHITE -> { buffer.put(0.0f); buffer.put(1.0f) }  // Always white in channel 1
+                    else         -> { buffer.put(0.0f); buffer.put(0.0f) }
                 }
             }
         }
-        buffer.rewind() // Important: Reset buffer position to the beginning
-        return TFloat32.tensorOf(createInputShape(), buffer).data()
+        buffer.rewind()
+        return buffer
     }
 
     private fun updateMoveLabel() {
@@ -378,14 +398,14 @@ class GoBoardApp : Application() {
                 gc.fillOval(hoshiX - 4, hoshiY - 4, 8.0, 8.0)
             }
         }
-        
+
         drawStones()
     }
 
     private fun drawStones() {
         val gc = canvas.graphicsContext2D
         val stoneRadius = cellWidth / 2.0 * 0.95
-        
+
         val currentBoard = boardHistory[currentMoveIndex + 1]
         val lastMove = if (currentMoveIndex >= 0) game.moves[currentMoveIndex] else null
 
@@ -395,7 +415,7 @@ class GoBoardApp : Application() {
                 if (player != Player.EMPTY) {
                     val centerX = padding + x * cellWidth
                     val centerY = padding + y * cellWidth
-                    
+
                     gc.fill = if (player == Player.BLACK) Color.BLACK else Color.WHITE
                     gc.fillOval(centerX - stoneRadius, centerY - stoneRadius, stoneRadius * 2, stoneRadius * 2)
 
@@ -404,7 +424,7 @@ class GoBoardApp : Application() {
                         gc.lineWidth = 0.5
                         gc.strokeOval(centerX - stoneRadius, centerY - stoneRadius, stoneRadius * 2, stoneRadius * 2)
                     }
-                    
+
                     if (lastMove != null && x == lastMove.x && y == lastMove.y) {
                         gc.fill = if (lastMove.player == Player.BLACK) Color.WHITE else Color.BLACK
                         val dotRadius = stoneRadius * 0.3
@@ -413,8 +433,8 @@ class GoBoardApp : Application() {
                 }
             }
         }
-        
-        // --- NEW: Draw the predicted move hint ---
+
+        // Draw the predicted move hint
         predictedMove?.let { (px, py) ->
             val centerX = padding + px * cellWidth
             val centerY = padding + py * cellWidth

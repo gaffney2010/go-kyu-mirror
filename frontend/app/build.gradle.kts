@@ -54,6 +54,8 @@ java {
 application {
     // Define the main class for the application.
     mainClass = "GoBoardAppKt"
+    
+    applicationDefaultJvmArgs = listOf("-Dmodel.path=${rootProject.projectDir.absolutePath}/exported_model")
 }
 
 tasks.named<Test>("test") {

@@ -124,6 +124,43 @@ def serialize_example(board_state, next_move):
     example_proto = tf.train.Example(features=tf.train.Features(feature=feature))
     return example_proto.SerializeToString()
 
+def write_to_tfrecord_append(shard_path, moves):
+    """
+    Safely append moves to a TFRecord file.
+    Since TFRecordWriter doesn't support direct append mode, we collect all existing
+    data and rewrite the entire file with the new data appended.
+    """
+    try:
+        # Read existing records if the file exists
+        existing_examples = []
+        if tf.io.gfile.exists(shard_path):
+            try:
+                for record in tf.data.TFRecordDataset(shard_path, compression_type="GZIP"):
+                    existing_examples.append(record.numpy())
+            except Exception as e:
+                # If we can't read the existing file, log a warning but continue
+                logging.warning(f"Could not read existing data from {shard_path}: {e}")
+                existing_examples = []
+        
+        # Serialize new moves
+        new_examples = []
+        for board_state, next_move in moves:
+            example = serialize_example(board_state, next_move)
+            new_examples.append(example)
+        
+        # Write all examples (existing + new) to the file
+        with tf.io.TFRecordWriter(shard_path, options=tf.io.TFRecordOptions(compression_type="GZIP")) as writer:
+            # Write existing examples first
+            for example in existing_examples:
+                writer.write(example)
+            # Write new examples
+            for example in new_examples:
+                writer.write(example)
+                
+    except Exception as e:
+        logging.error(f"Failed to write to {shard_path}: {e}")
+        raise
+
 def main():
     """Main function to find, process, and save SGF data to TFRecords."""
     # --- Create Directories for each Rank ---
@@ -183,21 +220,8 @@ def main():
                     rank_dir = os.path.join(TFRECORD_OUTPUT_DIR, rank)
                     shard_path = os.path.join(rank_dir, f"data.tfrecord-{shard_index:05d}-of-{NUM_SHARDS:05d}")
 
-                    # Open the specific shard in append mode, write to it, and close it.
-                    # This prevents both the "Too many open files" error and data loss on crash.
-                    try:
-                        with tf.io.TFRecordWriter(shard_path, options=tf.io.TFRecordOptions(compression_type="GZIP")) as writer:
-                             for board_state, next_move in moves:
-                                example = serialize_example(board_state, next_move)
-                                writer.write(example)
-                    except Exception as e:
-                        # Fallback for older TensorFlow versions that might not support append in TFRecordWriter
-                        with tf.io.gfile.GFile(shard_path, 'ab') as f_out:
-                            with tf.io.TFRecordWriter(f_out, options=tf.io.TFRecordOptions(compression_type="GZIP")) as writer:
-                                for board_state, next_move in moves:
-                                    example = serialize_example(board_state, next_move)
-                                    writer.write(example)
-
+                    # Use the dedicated append function
+                    write_to_tfrecord_append(shard_path, moves)
 
                 # Now that all moves from this file are safely written, log the file as processed.
                 total_moves_processed += sum(len(m) for m in moves_to_write.values())
