@@ -12,6 +12,8 @@ from tensorflow.keras.models import Model
 # --- Configuration ---
 # Point this to the directory containing the preprocessed data for the desired rank.
 TFRECORD_DIRECTORY = 'data/tfrecords/10k'
+# Specific file to read
+TFRECORD_FILE = 'data.tfrecord-00000'
 # Keras requires the '.weights.h5' extension when using save_weights_only=True.
 MODEL_FILE = 'go_bot_10k_predictor.weights.h5'  # Where to save the trained model weights.
 
@@ -33,7 +35,7 @@ def parse_tfrecord_fn(example):
     
     example = tf.io.parse_single_example(example, feature_description)
     
-    board_state = tf.io.parse_tensor(example['board_state'], out_type=tf.float32)
+    board_state = tf.io.decode_raw(example['board_state'], out_type=tf.float32)
     board_state = tf.reshape(board_state, INPUT_SHAPE)
     
     next_move = tf.cast(example['next_move'], tf.int32)
@@ -42,15 +44,16 @@ def parse_tfrecord_fn(example):
     return board_state, next_move_one_hot
 
 def create_dataset(tfrecord_dir):
-    """Creates a tf.data.Dataset from a directory of TFRecord files."""
-    file_paths = tf.io.gfile.glob(os.path.join(tfrecord_dir, "*.tfrecord*"))
-    if not file_paths:
-        raise ValueError(f"No TFRecord files found in directory: {tfrecord_dir}")
-        
-    print(f"Found {len(file_paths)} TFRecord files.")
+    """Creates a tf.data.Dataset from a specific TFRecord file."""
+    file_path = os.path.join(tfrecord_dir, TFRECORD_FILE)
     
-    # Create a dataset from the files
-    dataset = tf.data.TFRecordDataset(file_paths, compression_type="GZIP", num_parallel_reads=tf.data.AUTOTUNE)
+    if not os.path.exists(file_path):
+        raise ValueError(f"TFRecord file not found: {file_path}")
+        
+    print(f"Reading from single TFRecord file: {file_path}")
+    
+    # Create a dataset from the single file
+    dataset = tf.data.TFRecordDataset(file_path, num_parallel_reads=tf.data.AUTOTUNE)
     
     # Shuffle, parse, batch, and prefetch for performance
     dataset = dataset.shuffle(BUFFER_SIZE)
@@ -97,12 +100,12 @@ def create_model(num_residual_blocks=5, filters=128):
 
 def main():
     """Main function to load data, create a model, and start training."""
-    print("Creating dataset from TFRecords...")
+    print("Creating dataset from single TFRecord file...")
     try:
         train_dataset = create_dataset(TFRECORD_DIRECTORY)
     except ValueError as e:
         print(f"Error: {e}")
-        print("Please ensure you have run the preprocessing script and that the TFRECORD_DIRECTORY is correct.")
+        print(f"Please ensure the file '{TFRECORD_FILE}' exists in '{TFRECORD_DIRECTORY}'.")
         return
 
     print("Creating model...")
@@ -138,4 +141,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
