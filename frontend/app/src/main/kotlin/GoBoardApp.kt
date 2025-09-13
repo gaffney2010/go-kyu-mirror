@@ -17,6 +17,7 @@ import org.tensorflow.ndarray.Shape
 import org.tensorflow.ndarray.buffer.DataBuffers
 import org.tensorflow.types.TFloat32
 import java.nio.FloatBuffer
+import java.util.Optional
 import kotlin.concurrent.thread
 
 // Enum to represent the players or an empty intersection.
@@ -288,54 +289,55 @@ class GoBoardApp : Application() {
                 
                 var finalPrediction: Pair<Int, Int>? = null
 
-                // Create input tensor and close it automatically with .use
+                // Create input tensor
                 TFloat32.tensorOf(createInputShape(), DataBuffers.of(createInputBuffer(board, nextPlayer))).use { inputTensor ->
 
-                    // Run the model. The returned Result is also AutoCloseable and is closed by .use
-                    model!!.session().runner()
-                        // --- UPDATED with correct names from inspection script ---
-                        .feed("keras_tensor", inputTensor)
-                        .fetch("keras_tensor_43")
-                        .run().use { result ->
+                    // Use the SavedModel signature instead of low-level Session API
+                    val servingDefault = model!!.function("serving_default")
+                    
+                    // Create input map with the correct tensor name
+                    val inputs = mapOf("keras_tensor" to inputTensor)
+                    
+                    // Run inference
+                    val outputs = servingDefault.call(inputs)
+                    
+                    // Get the output tensor - extract from Optional
+                    val outputTensorOpt = outputs["output_0"] as Optional<*>
+                    val outputTensor = outputTensorOpt.get() as TFloat32
 
-                            // The Result is an Iterable of Map.Entry<String, Tensor>.
-                            // Get the first entry, and then get its .value to get the actual Tensor.
-                            val outputTensor: Tensor = result.first().value
+                    // Process Output Tensor - try direct access instead of copyTo
+                    val probabilities = FloatArray(game.size * game.size + 1)
 
-                            // Process Output Tensor
-                            val probabilities = FloatArray(game.size * game.size + 1)
-                            
-                            // 1. Create a destination NdArray that wraps our float array using the spread operator (*)
-                            val destNdArray = NdArrays.vectorOf(*probabilities)
-                            // 2. Copy the tensor data into our destination, which writes to the underlying array.
-                            (outputTensor as TFloat32).copyTo(destNdArray)
+                    // Copy values manually instead of using copyTo
+                    for (i in probabilities.indices) {
+                        probabilities[i] = outputTensor.getFloat(0, i.toLong())
+                    }
 
-                            var bestMoveIndex = -1
-                            var maxProb = -1.0f
-                            for (i in probabilities.indices) {
-                                val x = i % game.size
-                                val y = i / game.size
-                                val isPassMove = (i == game.size * game.size)
-                                if (probabilities[i] > maxProb && (isPassMove || board[y][x] == Player.EMPTY)) {
-                                    maxProb = probabilities[i]
-                                    bestMoveIndex = i
-                                }
-                            }
-
-                            finalPrediction = if (bestMoveIndex != -1 && bestMoveIndex < game.size * game.size) {
-                                val x = bestMoveIndex % game.size
-                                val y = bestMoveIndex / game.size
-                                x to y
-                            } else {
-                                null
-                            }
+                    var bestMoveIndex = -1
+                    var maxProb = -1.0f
+                    for (i in probabilities.indices) {
+                        val x = i % game.size
+                        val y = i / game.size
+                        val isPassMove = (i == game.size * game.size)
+                        if (probabilities[i] > maxProb && (isPassMove || board[y][x] == Player.EMPTY)) {
+                            maxProb = probabilities[i]
+                            bestMoveIndex = i
                         }
+                    }
+
+                    finalPrediction = if (bestMoveIndex != -1 && bestMoveIndex < game.size * game.size) {
+                        val x = bestMoveIndex % game.size
+                        val y = bestMoveIndex / game.size
+                        x to y
+                    } else {
+                        null
+                    }
                 }
                 
                 // Update the UI on the JavaFX Application Thread
                 Platform.runLater {
                     predictedMove = finalPrediction
-                    drawBoard() // Redraw the board with the new hint
+                    drawBoard()
                 }
 
             } catch (e: Exception) {
@@ -352,14 +354,23 @@ class GoBoardApp : Application() {
 
     /** Helper function to convert our board array to the required FloatBuffer for the model */
     private fun createInputBuffer(board: Array<Array<Player>>, currentPlayer: Player): FloatBuffer {
+<<<<<<< HEAD
         val opponent = currentPlayer.opponent()
+=======
+>>>>>>> b9b0be2314fe5fccf54cbd385883e471578ecd4a
         val buffer = FloatBuffer.allocate(1 * game.size * game.size * 2)
         for (y in 0 until game.size) {
             for (x in 0 until game.size) {
                 when (board[y][x]) {
+<<<<<<< HEAD
                     currentPlayer -> { buffer.put(1.0f); buffer.put(0.0f) }
                     opponent      -> { buffer.put(0.0f); buffer.put(1.0f) }
                     else          -> { buffer.put(0.0f); buffer.put(0.0f) }
+=======
+                    Player.BLACK -> { buffer.put(1.0f); buffer.put(0.0f) }  // Always black in channel 0
+                    Player.WHITE -> { buffer.put(0.0f); buffer.put(1.0f) }  // Always white in channel 1
+                    else         -> { buffer.put(0.0f); buffer.put(0.0f) }
+>>>>>>> b9b0be2314fe5fccf54cbd385883e471578ecd4a
                 }
             }
         }
