@@ -354,23 +354,13 @@ class GoBoardApp : Application() {
 
     /** Helper function to convert our board array to the required FloatBuffer for the model */
     private fun createInputBuffer(board: Array<Array<Player>>, currentPlayer: Player): FloatBuffer {
-<<<<<<< HEAD
-        val opponent = currentPlayer.opponent()
-=======
->>>>>>> b9b0be2314fe5fccf54cbd385883e471578ecd4a
         val buffer = FloatBuffer.allocate(1 * game.size * game.size * 2)
         for (y in 0 until game.size) {
             for (x in 0 until game.size) {
                 when (board[y][x]) {
-<<<<<<< HEAD
-                    currentPlayer -> { buffer.put(1.0f); buffer.put(0.0f) }
-                    opponent      -> { buffer.put(0.0f); buffer.put(1.0f) }
-                    else          -> { buffer.put(0.0f); buffer.put(0.0f) }
-=======
                     Player.BLACK -> { buffer.put(1.0f); buffer.put(0.0f) }  // Always black in channel 0
                     Player.WHITE -> { buffer.put(0.0f); buffer.put(1.0f) }  // Always white in channel 1
                     else         -> { buffer.put(0.0f); buffer.put(0.0f) }
->>>>>>> b9b0be2314fe5fccf54cbd385883e471578ecd4a
                 }
             }
         }
