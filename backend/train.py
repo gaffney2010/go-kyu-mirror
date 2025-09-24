@@ -3,141 +3,153 @@ import tensorflow as tf
 from tensorflow.keras.layers import Input, Conv2D, BatchNormalization, ReLU, Add, Flatten, Dense
 from tensorflow.keras.models import Model
 
-# --- GPU/CPU Configuration ---
-# By default, TensorFlow will try to use a GPU if it's available.
-# If you want to force CPU execution for training (not recommended for performance),
-# you can uncomment the following line:
-# os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
 # --- Configuration ---
-# Point this to the directory containing the preprocessed data for the desired rank.
-TFRECORD_DIRECTORY = 'data/tfrecords/10k'
-# Specific file to read
+TFRECORD_BASE_DIR = 'data/tfrecords'
 TFRECORD_FILE = 'data.tfrecord-00000'
-# Keras requires the '.weights.h5' extension when using save_weights_only=True.
-MODEL_FILE = 'go_bot_10k_predictor.weights.h5'  # Where to save the trained model weights.
+RANKS = [f"{i}k" for i in range(1, 16)]
 
+# The LATEST training checkpoint will be saved as a single, reliable .keras file
+CHECKPOINT_FILE = 'training_checkpoint.keras'
+
+# Model and training parameters
 BOARD_SIZE = 19
-INPUT_SHAPE = (BOARD_SIZE, BOARD_SIZE, 2)  # Board state: player's stones, opponent's stones
-NUM_OUTPUTS = BOARD_SIZE * BOARD_SIZE + 1  # 361 board positions + 1 for pass
-
-# Training parameters
+INPUT_SHAPE = (BOARD_SIZE, BOARD_SIZE, 2)
+NUM_OUTPUTS = BOARD_SIZE * BOARD_SIZE + 1
 BATCH_SIZE = 128
-EPOCHS = 10 # You can train for more epochs since reading data is now very fast.
-BUFFER_SIZE = 10000 # For shuffling the dataset. A larger buffer means better shuffling.
+EPOCHS = 10
+BUFFER_SIZE = 10000
+SAVE_FREQ_BATCHES = 1200 # Frequency for saving checkpoints
 
+# --- Model Definition with Explicit Naming ---
+def residual_block(x, filters=128, block_num=0):
+    res = x
+    x = Conv2D(filters, 3, padding='same', name=f'res{block_num}_conv1')(x)
+    x = BatchNormalization(name=f'res{block_num}_bn1')(x)
+    x = ReLU(name=f'res{block_num}_relu1')(x)
+    x = Conv2D(filters, 3, padding='same', name=f'res{block_num}_conv2')(x)
+    x = BatchNormalization(name=f'res{block_num}_bn2')(x)
+    x = Add(name=f'res{block_num}_add')([x, res])
+    x = ReLU(name=f'res{block_num}_relu2')(x)
+    return x
+
+def create_multi_head_model(num_ranks, num_residual_blocks=5, filters=128):
+    inputs = Input(shape=INPUT_SHAPE, name='input_1')
+    x = Conv2D(filters, 3, padding='same', name='stem_conv')(inputs)
+    x = BatchNormalization(name='stem_bn')(x)
+    x = ReLU(name='stem_relu')(x)
+    for i in range(num_residual_blocks):
+        x = residual_block(x, filters, block_num=i)
+    policy_heads = {}
+    for i in range(num_ranks):
+        layer_name = f'policy_rank_{i}'
+        policy = Conv2D(2, 1, padding='same', name=f'policy_conv_{i}')(x)
+        policy = BatchNormalization(name=f'policy_bn_{i}')(policy)
+        policy = ReLU(name=f'policy_relu_{i}')(policy)
+        policy = Flatten(name=f'policy_flatten_{i}')(policy)
+        policy = Dense(NUM_OUTPUTS, activation='softmax', name=layer_name)(policy)
+        policy_heads[layer_name] = policy
+    model = Model(inputs=inputs, outputs=policy_heads)
+    return model
+
+# --- Data Loading Functions ---
 def parse_tfrecord_fn(example):
-    """Parses a single record from a TFRecord file."""
     feature_description = {
         'board_state': tf.io.FixedLenFeature([], tf.string),
         'next_move': tf.io.FixedLenFeature([], tf.int64),
     }
-    
     example = tf.io.parse_single_example(example, feature_description)
-    
     board_state = tf.io.decode_raw(example['board_state'], out_type=tf.float32)
     board_state = tf.reshape(board_state, INPUT_SHAPE)
-    
     next_move = tf.cast(example['next_move'], tf.int32)
     next_move_one_hot = tf.one_hot(next_move, depth=NUM_OUTPUTS)
-    
     return board_state, next_move_one_hot
 
-def create_dataset(tfrecord_dir):
-    """Creates a tf.data.Dataset from a specific TFRecord file."""
-    file_path = os.path.join(tfrecord_dir, TFRECORD_FILE)
-    
+def create_rank_dataset(rank):
+    file_path = os.path.join(TFRECORD_BASE_DIR, rank, TFRECORD_FILE)
     if not os.path.exists(file_path):
-        raise ValueError(f"TFRecord file not found: {file_path}")
-        
-    print(f"Reading from single TFRecord file: {file_path}")
-    
-    # Create a dataset from the single file
+        return None
     dataset = tf.data.TFRecordDataset(file_path, num_parallel_reads=tf.data.AUTOTUNE)
-    
-    # Shuffle, parse, batch, and prefetch for performance
-    dataset = dataset.shuffle(BUFFER_SIZE)
-    dataset = dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.batch(BATCH_SIZE)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
+    return dataset.map(parse_tfrecord_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
-def residual_block(x, filters=128):
-    """A single residual block for the ResNet architecture."""
-    res = x
-    x = Conv2D(filters, 3, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    x = Conv2D(filters, 3, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = Add()([x, res])
-    x = ReLU()(x)
-    return x
-
-def create_model(num_residual_blocks=5, filters=128):
-    """Creates a ResNet model similar to modern Go engines."""
-    inputs = Input(shape=INPUT_SHAPE)
-    
-    # Stem: Initial convolution
-    x = Conv2D(filters, 3, padding='same')(inputs)
-    x = BatchNormalization()(x)
-    x = ReLU()(x)
-    
-    # Trunk: A stack of residual blocks
-    for _ in range(num_residual_blocks):
-        x = residual_block(x, filters)
+def create_combined_dataset():
+    """
+    Creates a combined dataset by interleaving samples from all ranks
+    to ensure perfectly balanced shuffling from the start.
+    """
+    all_datasets, available_ranks = [], []
+    for i, rank in enumerate(RANKS):
+        dataset = create_rank_dataset(rank)
+        if dataset is not None:
+            # Add the rank index to each sample within its own dataset
+            rank_dataset = dataset.map(
+                lambda board, move: (board, move, tf.constant(i, dtype=tf.int32)),
+                num_parallel_calls=tf.data.AUTOTUNE
+            )
+            all_datasets.append(rank_dataset)
+            available_ranks.append(rank)
+            
+    if not all_datasets:
+        raise ValueError("No valid TFRecord files found for any rank!")
         
-    # Policy Head
-    policy = Conv2D(2, 1, padding='same')(x)
-    policy = BatchNormalization()(policy)
-    policy = ReLU()(policy)
-    policy = Flatten()(policy)
-    policy = Dense(NUM_OUTPUTS, activation='softmax', name='policy')(policy)
-    
-    model = Model(inputs=inputs, outputs=policy)
-    return model
+    print(f"Found data for ranks: {available_ranks}")
+    print("Interleaving datasets for balanced shuffling...")
 
+    # Use sample_from_datasets to create a perfectly mixed stream of data
+    # This pulls from all rank datasets simultaneously.
+    combined_dataset = tf.data.Dataset.sample_from_datasets(
+        all_datasets,
+        stop_on_empty_dataset=True # Stop when the smallest dataset is exhausted
+    )
+    
+    # Now, the shuffle buffer will be filled with a mix of all ranks
+    combined_dataset = combined_dataset.shuffle(BUFFER_SIZE)
+    combined_dataset = combined_dataset.batch(BATCH_SIZE)
+    combined_dataset = combined_dataset.prefetch(tf.data.AUTOTUNE)
+    
+    return combined_dataset, available_ranks
+
+# --- Main Execution ---
 def main():
-    """Main function to load data, create a model, and start training."""
-    print("Creating dataset from single TFRecord file...")
-    try:
-        train_dataset = create_dataset(TFRECORD_DIRECTORY)
-    except ValueError as e:
-        print(f"Error: {e}")
-        print(f"Please ensure the file '{TFRECORD_FILE}' exists in '{TFRECORD_DIRECTORY}'.")
-        return
-
-    print("Creating model...")
-    model = create_model()
+    """Main function to load data, create model, and train with reliable, frequent checkpointing."""
+    train_dataset, available_ranks = create_combined_dataset()
+    num_available_ranks = len(available_ranks)
     
-    # Check if a model file already exists to continue training
-    if os.path.exists(MODEL_FILE):
-        print(f"Found existing model at '{MODEL_FILE}'. Loading weights to continue training.")
-        model.load_weights(MODEL_FILE)
-        
-    model.compile(optimizer='adam',
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
-                  
+    # Check if a checkpoint FILE exists to resume training
+    if os.path.exists(CHECKPOINT_FILE):
+        print(f"Resuming training from checkpoint: {CHECKPOINT_FILE}")
+        model = tf.keras.models.load_model(CHECKPOINT_FILE)
+    else:
+        print("Starting new training session...")
+        model = create_multi_head_model(num_available_ranks)
+
+    losses = {f'policy_rank_{i}': 'categorical_crossentropy' for i in range(num_available_ranks)}
+    metrics = {f'policy_rank_{i}': ['accuracy'] for i in range(num_available_ranks)}
+    model.compile(optimizer='adam', loss=losses, metrics=metrics)
     model.summary()
 
-    # Callback to save the model after every epoch
+    # This callback saves the ENTIRE MODEL to a single .keras file frequently.
     model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=MODEL_FILE,
-        save_weights_only=True,
-        monitor='loss',
-        mode='min',
-        save_best_only=True)
+        filepath=CHECKPOINT_FILE,      # Saves to the correct .keras file
+        save_weights_only=False,       # Saves the full model, which is reliable
+        save_freq=SAVE_FREQ_BATCHES    # Saves every N batches
+    )
 
-    print("\nStarting training...")
+    print(f"\nTraining... A checkpoint will be saved to '{CHECKPOINT_FILE}' every {SAVE_FREQ_BATCHES} batches.")
+    
+    def transform_for_multihead_and_weighting(board_states, moves, rank_indices):
+        outputs = {f'policy_rank_{i}': moves for i in range(num_available_ranks)}
+        sample_weights = {f'policy_rank_{i}': tf.cast(tf.equal(rank_indices, i), tf.float32) for i in range(num_available_ranks)}
+        return board_states, outputs, sample_weights
+    
+    weighted_dataset = train_dataset.map(transform_for_multihead_and_weighting, num_parallel_calls=tf.data.AUTOTUNE)
+
     model.fit(
-        train_dataset,
+        weighted_dataset,
         epochs=EPOCHS,
         callbacks=[model_checkpoint_callback]
     )
-    print("\nTraining complete.")
-    print(f"Final model saved to '{MODEL_FILE}'")
+    print(f"\nTraining complete. Latest model checkpoint saved at: {os.path.abspath(CHECKPOINT_FILE)}")
 
 if __name__ == '__main__':
     main()
+

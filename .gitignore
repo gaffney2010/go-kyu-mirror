@@ -4,3 +4,5 @@ backend/preprocessing_state.txt
 __pycache__
 exported_model
 *.h5
+exported_model_anyk/
+training_checkpoint.keras
