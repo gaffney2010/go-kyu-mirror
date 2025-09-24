@@ -3,4 +3,6 @@ backend/preprocessing_state.txt
 *.log
 __pycache__
 exported_model
+exported_model_anyk
 *.h5
+.DS_Store

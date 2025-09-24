@@ -8,6 +8,9 @@ import javafx.scene.control.Label
 import javafx.scene.layout.BorderPane
 import javafx.scene.layout.HBox
 import javafx.scene.paint.Color
+import javafx.scene.text.Font
+import javafx.scene.text.FontWeight
+import javafx.scene.text.TextAlignment
 import javafx.stage.Stage
 import org.tensorflow.Result
 import org.tensorflow.SavedModelBundle
@@ -35,6 +38,9 @@ enum class Player {
 
 // Data class to hold information about a single move.
 data class Move(val player: Player, val x: Int, val y: Int)
+
+// Data class to hold rank prediction information
+data class RankPrediction(val rank: String, val x: Int, val y: Int)
 
 /**
  * A simple SGF parser and game state container.
@@ -89,7 +95,10 @@ class GoBoardApp : Application() {
 
     // --- AI Model Properties ---
     private var model: SavedModelBundle? = null
-    private var predictedMove: Pair<Int, Int>? = null // Store the predicted (x, y)
+    private var predictedMoves: List<RankPrediction> = emptyList() // Store multiple rank predictions
+
+    // --- Rank definitions (1k is best, 15k is worst) ---
+    private val ranks = (1..15).map { "${it}k" }
 
     // --- UI Elements ---
     private val canvas = Canvas(canvasSize, canvasSize)
@@ -140,14 +149,14 @@ class GoBoardApp : Application() {
 
         // Load the TensorFlow model
         try {
-            // Get the absolute path from the system property we set in Gradle.
-            val modelPath = System.getProperty("model.path", "exported_model")
+            // Use the new exported model directory
+            val modelPath = System.getProperty("model.path", "exported_model_anyk")
             println("Attempting to load model from path: $modelPath") // For debugging
 
             model = SavedModelBundle.load(modelPath, "serve")
             println("TensorFlow model loaded successfully.")
         } catch (e: Exception) {
-            println("ERROR: Could not load TensorFlow model from 'exported_model' directory.")
+            println("ERROR: Could not load TensorFlow model from 'exported_model_anyk' directory.")
             e.printStackTrace()
         }
 
@@ -189,8 +198,8 @@ class GoBoardApp : Application() {
         }
 
         updateMoveLabel()
-        predictedMove = null // Clear old prediction
-        drawBoard() // Redraw immediately to remove the old hint
+        predictedMoves = emptyList() // Clear old predictions
+        drawBoard() // Redraw immediately to remove the old hints
 
         // Run prediction in the background
         runPrediction()
@@ -267,84 +276,213 @@ class GoBoardApp : Application() {
     }
 
     // --- AI Prediction Functions ---
-
     /**
-     * Runs the loaded TensorFlow model to predict the next move.
-     */
+    * Runs the loaded TensorFlow model to predict the next move for each rank.
+    * FIXED VERSION: Checks for multiple output tensors (output_0, output_1, etc.)
+    */
     private fun runPrediction() {
-        // Guard clause: Don't predict if model isn't loaded or game is over.
-        if (model == null || currentMoveIndex >= game.moves.size) {
-            Platform.runLater {
-                predictedMove = null
-                drawBoard()
-            }
+        if (model == null) {
+            println("DEBUG: runPrediction() called, but model is null. Aborting.")
             return
         }
+        if (currentMoveIndex >= game.moves.size) {
+            return // End of game, normal exit.
+        }
 
-        // Run inference on a background thread to prevent UI freezing
+        val boardStateForThread = boardHistory[currentMoveIndex + 1].map { it.clone() }.toTypedArray()
+        val nextPlayerForThread = if (currentMoveIndex < 0) Player.BLACK else game.moves[currentMoveIndex].player.opponent()
+
         thread(isDaemon = true) {
+            var result: Result? = null
             try {
-                val board = boardHistory[currentMoveIndex + 1]
-                val nextPlayer = if (currentMoveIndex < 0) Player.BLACK else game.moves[currentMoveIndex].player.opponent()
-                
-                var finalPrediction: Pair<Int, Int>? = null
+                val inputBuffer = createInputBuffer(boardStateForThread, nextPlayerForThread)
+                inputBuffer.rewind() 
 
-                // Create input tensor
-                TFloat32.tensorOf(createInputShape(), DataBuffers.of(createInputBuffer(board, nextPlayer))).use { inputTensor ->
-
-                    // Use the SavedModel signature instead of low-level Session API
+                TFloat32.tensorOf(createInputShape(), DataBuffers.of(inputBuffer)).use { inputTensor ->
                     val servingDefault = model!!.function("serving_default")
+                    val inputs = mapOf("input_1" to inputTensor)
                     
-                    // Create input map with the correct tensor name
-                    val inputs = mapOf("keras_tensor" to inputTensor)
-                    
-                    // Run inference
-                    val outputs = servingDefault.call(inputs)
-                    
-                    // Get the output tensor - extract from Optional
-                    val outputTensorOpt = outputs["output_0"] as Optional<*>
-                    val outputTensor = outputTensorOpt.get() as TFloat32
+                    result = servingDefault.call(inputs)
 
-                    // Process Output Tensor - try direct access instead of copyTo
-                    val probabilities = FloatArray(game.size * game.size + 1)
-
-                    // Copy values manually instead of using copyTo
-                    for (i in probabilities.indices) {
-                        probabilities[i] = outputTensor.getFloat(0, i.toLong())
+                    val rankPredictions = mutableListOf<RankPrediction>()
+                    
+                    // Check for multiple outputs: policy_rank_1, policy_rank_2, etc.
+                    var foundOutputs = 0
+                    for (i in 0 until 15) {
+                        val outputKey = "policy_rank_$i"
+                        val outputTensor = result!!.get(outputKey)?.orElse(null) as? TFloat32
+                        
+                        if (outputTensor != null) {
+                            foundOutputs++
+                            val outputShape = outputTensor.shape()
+                            val totalOutputs = outputShape.get(1).toInt()
+                            
+                            // Process this output tensor for rank predictions
+                            if (totalOutputs >= game.size * game.size) {
+                                var bestMoveIndex = -1
+                                var maxProb = -1.0f
+                                
+                                // Look at board positions (skip pass move if it exists)
+                                for (j in 0 until (game.size * game.size)) {
+                                    val probability = outputTensor.getFloat(0, j.toLong())
+                                    
+                                    val y = j / game.size
+                                    val x = j % game.size
+                                    
+                                    if (x >= 0 && x < game.size && y >= 0 && y < game.size) {
+                                        if (boardStateForThread[y][x] == Player.EMPTY && probability > maxProb) {
+                                            maxProb = probability
+                                            bestMoveIndex = j
+                                        }
+                                    }
+                                }
+                                
+                                if (bestMoveIndex != -1) {
+                                    val y = bestMoveIndex / game.size
+                                    val x = bestMoveIndex % game.size
+                                    val rank = if (i < ranks.size) ranks[i] else "rank_$i"
+                                    rankPredictions.add(RankPrediction(rank, x, y))
+                                }
+                            }
+                        }
                     }
-
-                    var bestMoveIndex = -1
-                    var maxProb = -1.0f
-                    for (i in probabilities.indices) {
-                        val x = i % game.size
-                        val y = i / game.size
-                        val isPassMove = (i == game.size * game.size)
-                        if (probabilities[i] > maxProb && (isPassMove || board[y][x] == Player.EMPTY)) {
-                            maxProb = probabilities[i]
-                            bestMoveIndex = i
+                    
+                    // If we only found output_0, process it as concatenated data
+                    if (foundOutputs == 1) {
+                        val outputTensor = result!!.get("output_0")?.orElse(null) as? TFloat32
+                        if (outputTensor != null) {
+                            val outputShape = outputTensor.shape()
+                            val totalOutputs = outputShape.get(1).toInt()
+                            
+                            if (totalOutputs == 362) {
+                                // Case 1: Single rank output (362 = 19*19 + 1)
+                                var bestMoveIndex = -1
+                                var maxProb = -1.0f
+                                
+                                // Look at all board positions (0 to 360, position 361 is pass)
+                                for (i in 0 until (game.size * game.size)) {
+                                    val probability = outputTensor.getFloat(0, i.toLong())
+                                    
+                                    val y = i / game.size
+                                    val x = i % game.size
+                                    
+                                    if (x >= 0 && x < game.size && y >= 0 && y < game.size) {
+                                        if (boardStateForThread[y][x] == Player.EMPTY && probability > maxProb) {
+                                            maxProb = probability
+                                            bestMoveIndex = i
+                                        }
+                                    }
+                                }
+                                
+                                if (bestMoveIndex != -1) {
+                                    val y = bestMoveIndex / game.size
+                                    val x = bestMoveIndex % game.size
+                                    rankPredictions.add(RankPrediction("mixed", x, y))
+                                }
+                                
+                            } else if (totalOutputs % 362 == 0) {
+                                // Case 2: Multiple concatenated ranks
+                                val numRanks = totalOutputs / 362
+                                
+                                for (rankIndex in 0 until minOf(numRanks, ranks.size)) {
+                                    val startIdx = rankIndex * 362
+                                    
+                                    var bestMoveIndex = -1
+                                    var maxProb = -1.0f
+                                    
+                                    // Look at board positions for this rank
+                                    for (i in 0 until (game.size * game.size)) {
+                                        val probability = outputTensor.getFloat(0, (startIdx + i).toLong())
+                                        
+                                        val y = i / game.size
+                                        val x = i % game.size
+                                        
+                                        if (x >= 0 && x < game.size && y >= 0 && y < game.size) {
+                                            if (boardStateForThread[y][x] == Player.EMPTY && probability > maxProb) {
+                                                maxProb = probability
+                                                bestMoveIndex = i
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (bestMoveIndex != -1) {
+                                        val y = bestMoveIndex / game.size
+                                        val x = bestMoveIndex % game.size
+                                        val rank = if (rankIndex < ranks.size) ranks[rankIndex] else "${rankIndex}k"
+                                        rankPredictions.add(RankPrediction(rank, x, y))
+                                    }
+                                }
+                                
+                            } else {
+                                // Try to find the highest probability moves anyway
+                                var bestMoveIndex = -1
+                                var maxProb = -1.0f
+                                
+                                for (i in 0 until minOf(totalOutputs, game.size * game.size)) {
+                                    val probability = outputTensor.getFloat(0, i.toLong())
+                                    
+                                    val y = i / game.size
+                                    val x = i % game.size
+                                    
+                                    if (x >= 0 && x < game.size && y >= 0 && y < game.size) {
+                                        if (boardStateForThread[y][x] == Player.EMPTY && probability > maxProb) {
+                                            maxProb = probability
+                                            bestMoveIndex = i
+                                        }
+                                    }
+                                }
+                                
+                                if (bestMoveIndex != -1) {
+                                    val y = bestMoveIndex / game.size
+                                    val x = bestMoveIndex % game.size
+                                    rankPredictions.add(RankPrediction("?", x, y))
+                                }
+                            }
                         }
                     }
 
-                    finalPrediction = if (bestMoveIndex != -1 && bestMoveIndex < game.size * game.size) {
-                        val x = bestMoveIndex % game.size
-                        val y = bestMoveIndex / game.size
-                        x to y
-                    } else {
-                        null
+                    val filteredPredictions = filterHighestRankPredictions(rankPredictions)
+                    Platform.runLater {
+                        predictedMoves = filteredPredictions
+                        drawBoard()
                     }
                 }
-                
-                // Update the UI on the JavaFX Application Thread
-                Platform.runLater {
-                    predictedMove = finalPrediction
-                    drawBoard()
-                }
-
             } catch (e: Exception) {
-                println("Error during model inference: ${e.message}")
+                println("--- [FATAL ERROR IN PREDICTION THREAD] ---")
                 e.printStackTrace()
+                println("------------------------------------------")
+            } finally {
+                result?.close()
             }
         }
+    }
+
+    /**
+     * Filters predictions to show only the highest rank per position.
+     * 1k > 2k > 3k > ... > 15k
+     */
+    private fun filterHighestRankPredictions(predictions: List<RankPrediction>): List<RankPrediction> {
+        val positionMap = mutableMapOf<Pair<Int, Int>, RankPrediction>()
+        
+        for (prediction in predictions) {
+            val position = prediction.x to prediction.y
+            val currentBest = positionMap[position]
+            
+            if (currentBest == null || isHigherRank(prediction.rank, currentBest.rank)) {
+                positionMap[position] = prediction
+            }
+        }
+        
+        return positionMap.values.toList()
+    }
+
+    /**
+     * Checks if rank1 is higher than rank2 (1k > 2k > 3k > ... > 15k)
+     */
+    private fun isHigherRank(rank1: String, rank2: String): Boolean {
+        val num1 = rank1.removeSuffix("k").toIntOrNull() ?: Int.MAX_VALUE
+        val num2 = rank2.removeSuffix("k").toIntOrNull() ?: Int.MAX_VALUE
+        return num1 < num2 // Lower number = higher rank
     }
 
     /** Helper function to define the tensor shape [1, 19, 19, 2] */
@@ -434,17 +572,36 @@ class GoBoardApp : Application() {
             }
         }
 
-        // Draw the predicted move hint
-        predictedMove?.let { (px, py) ->
-            val centerX = padding + px * cellWidth
-            val centerY = padding + py * cellWidth
+        // Draw the predicted move hints with rank labels
+        for (prediction in predictedMoves) {
+            val centerX = padding + prediction.x * cellWidth
+            val centerY = padding + prediction.y * cellWidth
             val radius = cellWidth / 3.0 // Make it smaller than a full stone
 
-            gc.globalAlpha = 0.6 // Make it semi-transparent
+            // Draw semi-transparent circle
+            gc.globalAlpha = 0.8
             gc.fill = Color.LIMEGREEN
             gc.fillOval(centerX - radius, centerY - radius, radius * 2, radius * 2)
-            gc.globalAlpha = 1.0 // Reset alpha for other drawing operations
+            
+            // Draw black border
+            gc.globalAlpha = 1.0
+            gc.stroke = Color.BLACK
+            gc.lineWidth = 2.0
+            gc.strokeOval(centerX - radius, centerY - radius, radius * 2, radius * 2)
+            
+            // Draw rank text
+            gc.fill = Color.BLACK
+            gc.font = Font.font("Arial", FontWeight.BOLD, radius * 0.7)
+            gc.textAlign = TextAlignment.CENTER
+            
+            // Center the text in the circle
+            val textBounds = gc.font.size
+            gc.fillText(prediction.rank, centerX, centerY + textBounds * 0.3)
         }
+        
+        // Reset graphics context
+        gc.globalAlpha = 1.0
+        gc.lineWidth = 1.0
     }
 }
 
